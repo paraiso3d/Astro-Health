@@ -6,7 +6,13 @@ Crew health monitoring system for astronauts on long-duration space missions. It
 
 ## Running it
 
-Requires [Node.js](https://nodejs.org) 22.13 or later. The console is built with React and Vite.
+**Stack:** React + Vite console, Node.js clinical engine, Supabase (Postgres and Auth).
+
+Requires [Node.js](https://nodejs.org) 22.13 or later and a [Supabase](https://supabase.com) project.
+
+1. Copy `.env.example` to `.env` and fill in your project URL, publishable key and secret key. Never commit `.env`.
+2. Deploy `supabase/migrations` to your project, either by linking the repo in Supabase (**Integrations → GitHub**) so that pushes to `main` apply it, or by running the SQL in the dashboard's SQL Editor.
+3. Install and start:
 
 ```bash
 npm install
@@ -18,7 +24,13 @@ npm start
 
 `npm start` builds the console and serves it from the Node server.
 
-Open <http://127.0.0.1:8787>. The first run creates one account per role, with random passwords, in `data/initial-credentials.txt`. Delete that file once the passwords are distributed.
+To confirm that the tables are deployed and locked down:
+
+```bash
+npm run check:supabase
+```
+
+Open <http://127.0.0.1:8787>. The first run creates one Supabase Auth account per role, with random passwords written to `data/initial-credentials.txt`. Delete that file once the passwords are distributed. Sign in with the username below; the app handles the matching email address.
 
 | Username | Role | Location | Sees |
 |---|---|---|---|
@@ -125,16 +137,18 @@ npm run dev
 ### 11. Privacy and security
 - Five roles, enforced on the server for every request
 - Command and operations see fitness status only, with reasons withheld. In an emergency, everyone aboard is alerted without clinical details
-- Salted scrypt password hashing, login lockout, HttpOnly SameSite=Strict session cookies with 12-hour expiry
+- Passwords are checked by Supabase Auth, with login lockout and HttpOnly SameSite=Strict session cookies that expire after 12 hours. Roles are stored in `app_metadata`, which users can't edit
+- Every Supabase table has Row Level Security on and no public access, so the publishable key can't read or write any data
 - Content Security Policy, input validation, request size limits, path traversal protection, parameter whitelists
 - Separate token authentication for devices
-- **Tamper-evident audit log**: a SHA-256 hash chain covering logins, record access, acknowledgements, doses, overrides, exports and configuration changes, with one-click verification
+- **Tamper-evident audit log**: a SHA-256 hash chain covering logins, record access, acknowledgements, doses, overrides, exports and configuration changes, with one-click verification. In Supabase it is also append-only: the database refuses edits and deletes, even with the secret key
 
 ### 12. Reports and data
 - Printable medical summary per crew member: readiness, 24-hour vital statistics, findings, alerts, medications and symptoms
 - CSV export of vitals (24 hours or 7 days), audited
 - Alert history
-- SQLite storage that survives restarts (alerts, dose, holds, limits, records), with 90-day telemetry retention
+- Supabase Postgres is the system of record (alerts, dose, holds, limits, records, audit, telemetry). A lost local copy rebuilds itself from Supabase on the next start
+- Telemetry: full-rate history for 90 days in the local copy, and one sample a minute per person for 30 days in Supabase, to stay within free-plan storage
 
 ### 13. Training and integration
 - Physiology and cabin simulator with 12 failure scenarios: hypoxia, tachyarrhythmia, cardiac pause, hypotension, fever, EVA heat stress, sensor dropout, telemetry loss, solar particle event, CO2 scrubber failure, cabin leak, thermal failure
@@ -174,9 +188,24 @@ Content-Type: application/json
 |---|---|---|
 | `PORT` | `8787` | Port to listen on |
 | `HOST` | `127.0.0.1` | Address to listen on |
-| `DATA_DIR` | `./data` | Database and credentials location |
+| `SUPABASE_URL` | none | Project URL (required) |
+| `SUPABASE_PUBLISHABLE_KEY` | none | Publishable key, used for sign-in (required) |
+| `SUPABASE_SECRET_KEY` | none | Secret key, server only (required) |
+| `DATA_DIR` | `./data` | Local working copy and credentials location |
 | `DATA_SOURCE` | `simulator` | `simulator` or `ingest` |
 | `INGEST_TOKEN` | none | Device token, required for `ingest` |
+
+## How it fits together
+
+```
+Browser (React)  <-->  Node engine  <-->  local working copy  --sync queue-->  Supabase Postgres
+                           |
+                           +--> Supabase Auth (checks passwords)
+```
+
+- **The Node engine stays because Supabase can't replace it.** It evaluates every vital sign once a second and applies per-role redaction, neither of which suits scheduled functions or browser queries.
+- **The browser never talks to the database.** It gets only what the server allows for that user's role, so no Supabase key reaches the browser.
+- **The alarm loop never waits on the internet.** Changes go to a queue on disk and reach Supabase within seconds, and they leave the queue only after Supabase confirms them. During an outage, alarms keep working, data queues up and the header shows it waiting.
 
 ## Project layout
 
@@ -187,12 +216,15 @@ src/
   system.js      Orchestrator: main loop, spacecraft and ground views, all actions
   link.js        Delay-tolerant space-ground link
   simulator.js   Physiology and cabin simulator, failure scenarios
-  store.js       SQLite storage and tamper-evident audit log
+  store.js       Local working copy, sync queue and tamper-evident audit log
+  cloud.js       Supabase sync, restore and Auth
   access.js      Role and confidentiality rules
-  auth.js        Passwords, sessions, lockout
+  auth.js        Sessions and lockout
   server.js      HTTP API, live stream, static files
   crew.js        Fictional crew and accounts (replace with real records)
 web/             React + Vite console (builds to dist/)
+supabase/        Database migrations
+scripts/         Live Supabase checks
 test/            Clinical, system and HTTP test suites
 ```
 
@@ -201,10 +233,13 @@ test/            Clinical, system and HTTP test suites
 Before real use, these need to be addressed:
 
 - **Certification and clinical validation** have not been done. See the notice at the top.
-- **Spacecraft and ground share one process and database here,** to model the link. A flight deployment would run separate nodes with real replication, and a real delay-tolerant networking stack in place of the modeled link.
+- **Spacecraft and ground share one process here,** to model the link. A flight deployment would run separate nodes, and a real delay-tolerant networking stack in place of the modeled link.
+- **Supabase is on Earth.** Monitoring continues without it, but new sign-ins need Supabase Auth to be reachable, and a real spacecraft would need on-board authentication.
+- **Sync is one-way while running.** The server writes to Supabase, and reads back only to rebuild an empty local copy, so run only one engine per project. Changes made directly in Supabase aren't picked up.
 - **Single server:** there is no redundancy or failover, which flight hardware would need.
-- **HTTP only:** put it behind TLS before exposing it beyond the local machine, and add the `Secure` cookie flag. Data is not encrypted at rest.
-- **Audit log:** the hash chain reveals tampering, but someone with full database access could rewrite the entire chain. Anchoring the latest hash on the ground would close that gap.
+- **HTTP only:** put it behind TLS before exposing it beyond the local machine, and add the `Secure` cookie flag. The local working copy is not encrypted at rest.
+- **Free-plan limits:** Supabase pauses inactive free projects, and storage is limited. A real deployment needs a paid plan and backups.
+- **Audit log:** someone with database owner access could remove the append-only rule and rewrite the entire chain. Anchoring the latest hash somewhere independent would close that gap.
 - **Rhythm analysis** is beat-interval screening only, not diagnostic ECG interpretation.
 - **Dose per person** is estimated from one cabin reading. Personal dosimeters remain the record.
 - **Account management:** accounts are created on first run, and there is no screen yet for changing passwords or managing users.
