@@ -1,0 +1,12 @@
+{
+  "name": "astrohealth",
+  "version": "1.0.0",
+  "description": "Crew health monitoring system for astronauts on long-duration space missions",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.js\""
+  }
+}
