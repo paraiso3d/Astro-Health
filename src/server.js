@@ -1,21 +1,21 @@
 import { timingSafeEqual } from 'node:crypto';
-import { chmodSync, createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canAudit, canRunTraining } from './access.js';
-import { Auth, generatePassword, hashPassword } from './auth.js';
+import { Auth } from './auth.js';
 import { ENV_PARAMS, SEVERITY_NAME, VITALS } from './clinical/limits.js';
 import { FORMULARY } from './clinical/pharmacy.js';
 import { PROTOCOLS } from './clinical/protocols.js';
 import { SYMPTOMS } from './clinical/triage.js';
-import { USERS } from './crew.js';
+import { SupabaseDirectory, SupabaseSync, createAdminClient, hydrateFromCloud } from './cloud.js';
 import { LINK_PRESETS } from './link.js';
 import { Store } from './store.js';
 import { ApiError, MissionSystem } from './system.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const PUBLIC_DIR = join(ROOT, 'public');
+const DIST_DIR = join(ROOT, 'dist');
 const MAX_BODY = 1024 * 1024;
 const COOKIE = 'astrohealth_session';
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
@@ -71,8 +71,8 @@ const requireRole = (condition) => {
 };
 
 /** Builds the HTTP server. Authentication is checked for every route except login, health and device ingest. */
-export function createApp({ system, store, ingestToken = null, clock = Date.now }) {
-  const auth = new Auth(store, clock);
+export function createApp({ system, store, directory, ingestToken = null, clock = Date.now, staticDir = DIST_DIR }) {
+  const auth = new Auth(store, directory, clock);
 
   const routes = [
     ['GET', /^\/api\/me$/, (c) => ({ user: c.user })],
@@ -137,8 +137,8 @@ export function createApp({ system, store, ingestToken = null, clock = Date.now 
 
   const serveStatic = (res, pathname) => {
     const requested = pathname === '/' ? '/index.html' : pathname;
-    const file = resolve(PUBLIC_DIR, `.${normalize(decodeURIComponent(requested))}`);
-    if (!file.startsWith(PUBLIC_DIR + sep) || !existsSync(file) || !statSync(file).isFile()) return json(res, 404, { error: 'not found' });
+    const file = resolve(staticDir, `.${normalize(decodeURIComponent(requested))}`);
+    if (!file.startsWith(staticDir + sep) || !existsSync(file) || !statSync(file).isFile()) return json(res, 404, { error: 'not found' });
     res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': MIME[extname(file)] ?? 'application/octet-stream' });
     createReadStream(file).pipe(res);
   };
@@ -162,7 +162,7 @@ export function createApp({ system, store, ingestToken = null, clock = Date.now 
 
     if (req.method === 'POST' && pathname === '/api/login') {
       const body = await readJson(req);
-      const result = auth.login(body.username, body.password);
+      const result = await auth.login(body.username, body.password);
       if (result.error) return json(res, result.status, { error: result.error });
       res.setHeader('Set-Cookie', `${COOKIE}=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`);
       return json(res, 200, { user: result.user });
@@ -212,25 +212,13 @@ export function createApp({ system, store, ingestToken = null, clock = Date.now 
   });
 }
 
-/** Creates user accounts with random passwords on first run and writes them to a private file. */
-export function provisionUsers(store, credentialsFile = null) {
-  if (store.userCount() > 0) return null;
-  const lines = ['# AstroHealth initial credentials. Delete this file once they are distributed.', ''];
-  const credentials = {};
-  for (const u of USERS) {
-    const password = generatePassword();
-    store.addUser({ ...u, ...hashPassword(password) });
-    credentials[u.username] = password;
-    lines.push(`${u.username.padEnd(10)} ${password}   (${u.role})`);
+async function main() {
+  if (existsSync(join(ROOT, '.env'))) process.loadEnvFile(join(ROOT, '.env'));
+  const { SUPABASE_URL: url, SUPABASE_PUBLISHABLE_KEY: publishableKey, SUPABASE_SECRET_KEY: secretKey } = process.env;
+  if (!url || !publishableKey || !secretKey) {
+    console.error('Supabase is not configured. Copy .env.example to .env and fill in the project URL and keys.');
+    process.exit(1);
   }
-  if (credentialsFile) {
-    writeFileSync(credentialsFile, `${lines.join('\n')}\n`, { mode: 0o600 });
-    chmodSync(credentialsFile, 0o600);
-  }
-  return credentials;
-}
-
-function main() {
   const dataDir = resolve(process.env.DATA_DIR ?? join(ROOT, 'data'));
   mkdirSync(dataDir, { recursive: true });
   const dataSource = process.env.DATA_SOURCE === 'ingest' ? 'ingest' : 'simulator';
@@ -239,16 +227,27 @@ function main() {
     console.error('DATA_SOURCE=ingest requires INGEST_TOKEN to be set.');
     process.exit(1);
   }
+  if (!existsSync(join(DIST_DIR, 'index.html'))) console.warn('No web build found. Run "npm run build", or use "npm start" which builds first.');
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? '127.0.0.1';
 
-  const store = new Store(join(dataDir, 'astrohealth.db'));
+  const adminClient = createAdminClient(url, secretKey);
+  const store = new Store(join(dataDir, 'astrohealth.db'), { mirror: true });
+  const directory = new SupabaseDirectory({ url, publishableKey, adminClient });
   const credentialsFile = join(dataDir, 'initial-credentials.txt');
-  const created = provisionUsers(store, credentialsFile);
-  if (created) console.log(`First run: created user accounts. Credentials are in ${credentialsFile}`);
+  try {
+    if (await hydrateFromCloud(store, adminClient)) console.log('Restored the local copy from Supabase.');
+    const created = await directory.ensureUsers(credentialsFile);
+    if (created) console.log(`Created ${created} Supabase Auth account(s). Credentials are in ${credentialsFile}`);
+  } catch (err) {
+    console.error(`Can't reach Supabase, or its tables aren't deployed yet: ${err.message}`);
+    process.exit(1);
+  }
 
+  const sync = new SupabaseSync({ store, client: adminClient });
   const system = new MissionSystem({ store, dataSource });
-  const server = createApp({ system, store, ingestToken });
+  system.cloudStatus = () => sync.status();
+  const server = createApp({ system, store, directory, ingestToken });
 
   const timer = setInterval(() => {
     try {
@@ -257,15 +256,18 @@ function main() {
       console.error('tick failed', err);
     }
   }, 1000);
+  const syncTimer = setInterval(() => sync.flush(), 2000);
 
   server.listen(port, host, () => {
-    console.log(`AstroHealth is running at http://${host === '0.0.0.0' ? 'localhost' : host}:${port} (data source: ${dataSource})`);
+    console.log(`AstroHealth is running at http://${host === '0.0.0.0' ? 'localhost' : host}:${port} (data source: ${dataSource}, database: Supabase)`);
   });
 
-  const shutdown = () => {
+  const shutdown = async () => {
     clearInterval(timer);
+    clearInterval(syncTimer);
     server.close();
     server.closeAllConnections();
+    await sync.flush();
     store.close();
     process.exit(0);
   };

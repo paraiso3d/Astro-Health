@@ -3,7 +3,6 @@ import { DatabaseSync } from 'node:sqlite';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, display_name TEXT, role TEXT NOT NULL, crew_id TEXT, salt TEXT NOT NULL, hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS vitals (ts INTEGER NOT NULL, crew_id TEXT NOT NULL, hr REAL, rr REAL, spo2 REAL, sys REAL, dia REAL, temp REAL, rmssd REAL, news INTEGER, activity TEXT);
 CREATE INDEX IF NOT EXISTS vitals_crew_ts ON vitals (crew_id, ts);
 CREATE TABLE IF NOT EXISTS env (ts INTEGER PRIMARY KEY, co2 REAL, o2 REAL, pressure REAL, cabin_temp REAL, humidity REAL, radiation REAL);
@@ -13,17 +12,23 @@ CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, cre
 CREATE INDEX IF NOT EXISTS records_kind ON records (kind, crew_id, ts);
 CREATE TABLE IF NOT EXISTS medications (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bundles (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, op TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, role TEXT, action TEXT NOT NULL, target TEXT, detail TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
 `;
 
 const GENESIS = '0'.repeat(64);
+const CLOUD_SAMPLE_MS = 60000;
 
 const auditHash = (r, prev) => createHash('sha256')
   .update(JSON.stringify([r.ts, r.actor, r.role, r.action, r.target, r.detail, prev]))
   .digest('hex');
 
 export class Store {
-  constructor(path = ':memory:') {
+  /** With mirror on, every change also joins an outbox that SupabaseSync sends to Supabase. */
+  constructor(path = ':memory:', { mirror = false } = {}) {
+    this.mirrorOn = mirror;
+    this.lastCloudVitals = new Map();
+    this.lastCloudEnv = -Infinity;
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
     this.db.exec(SCHEMA);
@@ -40,6 +45,7 @@ export class Store {
       bundleAdd: this.db.prepare('INSERT OR REPLACE INTO bundles (id, created_at, json) VALUES (?,?,?)'),
       bundleDel: this.db.prepare('DELETE FROM bundles WHERE id = ?'),
       audit: this.db.prepare('INSERT INTO audit (ts, actor, role, action, target, detail, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?)'),
+      outbox: this.db.prepare('INSERT INTO outbox (tbl, op, payload) VALUES (?,?,?)'),
     };
   }
 
@@ -59,6 +65,23 @@ export class Store {
     }
   }
 
+  #mirror(tbl, row, op = 'upsert') {
+    if (this.mirrorOn) this.stmt.outbox.run(tbl, op, JSON.stringify(row));
+  }
+
+  outboxRows(limit) {
+    return this.db.prepare('SELECT seq, tbl, op, payload FROM outbox ORDER BY seq LIMIT ?').all(limit)
+      .map((r) => ({ seq: r.seq, tbl: r.tbl, op: r.op, row: JSON.parse(r.payload) }));
+  }
+
+  outboxDeleteThrough(seq) {
+    this.db.prepare('DELETE FROM outbox WHERE seq <= ?').run(seq);
+  }
+
+  outboxCount() {
+    return this.db.prepare('SELECT COUNT(*) AS n FROM outbox').get().n;
+  }
+
   kvGet(key, fallback = null) {
     const row = this.stmt.kvGet.get(key);
     return row ? JSON.parse(row.v) : fallback;
@@ -66,31 +89,29 @@ export class Store {
 
   kvSet(key, value) {
     this.stmt.kvSet.run(key, JSON.stringify(value));
-  }
-
-  // Users
-  addUser(u) {
-    this.db.prepare('INSERT INTO users (username, display_name, role, crew_id, salt, hash) VALUES (?,?,?,?,?,?)')
-      .run(u.username, u.displayName, u.role, u.crewId, u.salt, u.hash);
-  }
-
-  getUser(username) {
-    return this.db.prepare('SELECT * FROM users WHERE username = ?').get(username) ?? null;
-  }
-
-  userCount() {
-    return this.db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
+    this.#mirror('kv', { k: key, v: value });
   }
 
   // Time series
   addVitals(rows) {
     this.transaction(() => {
-      for (const r of rows) this.stmt.vitals.run(r.ts, r.crewId, r.hr, r.rr, r.spo2, r.sys, r.dia, r.temp, r.rmssd, r.news, r.activity);
+      for (const r of rows) {
+        this.stmt.vitals.run(r.ts, r.crewId, r.hr, r.rr, r.spo2, r.sys, r.dia, r.temp, r.rmssd, r.news, r.activity);
+        // Supabase keeps one sample a minute per person; full-rate history stays local
+        if (r.ts - (this.lastCloudVitals.get(r.crewId) ?? -Infinity) >= CLOUD_SAMPLE_MS) {
+          this.lastCloudVitals.set(r.crewId, r.ts);
+          this.#mirror('vitals', { ts: r.ts, crew_id: r.crewId, hr: r.hr, rr: r.rr, spo2: r.spo2, sys: r.sys, dia: r.dia, temp: r.temp, rmssd: r.rmssd, news: r.news, activity: r.activity });
+        }
+      }
     });
   }
 
   addEnv(e) {
     this.stmt.env.run(e.ts, e.co2, e.o2, e.pressure, e.cabinTemp, e.humidity, e.radiation);
+    if (e.ts - this.lastCloudEnv >= CLOUD_SAMPLE_MS) {
+      this.lastCloudEnv = e.ts;
+      this.#mirror('env_readings', { ts: e.ts, co2: e.co2, o2: e.o2, pressure: e.pressure, cabin_temp: e.cabinTemp, humidity: e.humidity, radiation: e.radiation });
+    }
   }
 
   /** Averaged into at most maxPoints buckets. param must come from a server-side whitelist. */
@@ -122,6 +143,7 @@ export class Store {
   // Alerts
   saveAlert(a) {
     this.stmt.alert.run(a.id, a.raisedAt, a.status, a.severity, a.crewId, JSON.stringify(a));
+    this.#mirror('alerts', { id: a.id, raised_at: a.raisedAt, status: a.status, severity: a.severity, crew_id: a.crewId, data: a });
   }
 
   openAlerts() {
@@ -135,10 +157,13 @@ export class Store {
   // Records shared between the spacecraft and ground, with per-node visibility
   saveRecord({ id, kind, crewId, ts, data, visOnboard, visGround }) {
     this.stmt.record.run(id, kind, crewId, ts, JSON.stringify(data), visOnboard ? 1 : 0, visGround ? 1 : 0);
+    this.#mirror('records', { id, kind, crew_id: crewId, ts, data, vis_onboard: !!visOnboard, vis_ground: !!visGround });
   }
 
   setVisible(id, node) {
     this.db.prepare(`UPDATE records SET ${node === 'ground' ? 'vis_ground' : 'vis_onboard'} = 1 WHERE id = ?`).run(id);
+    const r = this.db.prepare('SELECT * FROM records WHERE id = ?').get(id);
+    if (r) this.#mirror('records', { id: r.id, kind: r.kind, crew_id: r.crew_id, ts: r.ts, data: JSON.parse(r.data), vis_onboard: !!r.vis_onboard, vis_ground: !!r.vis_ground });
   }
 
   getRecord(id) {
@@ -166,6 +191,7 @@ export class Store {
   // Medication inventory
   saveMedication(m) {
     this.db.prepare('INSERT INTO medications (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data').run(m.id, JSON.stringify(m));
+    this.#mirror('medications', { id: m.id, data: m });
   }
 
   medications() {
@@ -180,10 +206,12 @@ export class Store {
   // Link custody
   persistBundle(b) {
     this.stmt.bundleAdd.run(b.id, b.createdAt, JSON.stringify(b));
+    this.#mirror('bundles', { id: b.id, created_at: b.createdAt, data: b });
   }
 
   removeBundle(id) {
     this.stmt.bundleDel.run(id);
+    this.#mirror('bundles', { id }, 'delete');
   }
 
   pendingBundles() {
@@ -195,8 +223,31 @@ export class Store {
     const detailText = detail === null ? null : JSON.stringify(detail);
     const row = { ts, actor, role, action, target, detail: detailText };
     const hash = auditHash(row, this.lastHash);
-    this.stmt.audit.run(ts, actor, role, action, target, detailText, this.lastHash, hash);
+    const { lastInsertRowid } = this.stmt.audit.run(ts, actor, role, action, target, detailText, this.lastHash, hash);
+    this.#mirror('audit', { seq: Number(lastInsertRowid), ...row, prev_hash: this.lastHash, hash });
     this.lastHash = hash;
+  }
+
+  /** Loads a local copy from rows read out of Supabase, without queueing them to go back. */
+  importFromCloud({ kv, vitals, env_readings: env, alerts, records, medications, bundles, audit }) {
+    const mirror = this.mirrorOn;
+    this.mirrorOn = false;
+    try {
+      this.transaction(() => {
+        for (const r of kv) this.kvSet(r.k, r.v);
+        for (const r of alerts) this.saveAlert(r.data);
+        for (const r of records) this.saveRecord({ id: r.id, kind: r.kind, crewId: r.crew_id, ts: r.ts, data: r.data, visOnboard: r.vis_onboard, visGround: r.vis_ground });
+        for (const r of medications) this.saveMedication(r.data);
+        for (const r of bundles) this.persistBundle(r.data);
+        for (const r of vitals) this.stmt.vitals.run(r.ts, r.crew_id, r.hr, r.rr, r.spo2, r.sys, r.dia, r.temp, r.rmssd, r.news, r.activity);
+        for (const r of env) this.stmt.env.run(r.ts, r.co2, r.o2, r.pressure, r.cabin_temp, r.humidity, r.radiation);
+        const insert = this.db.prepare('INSERT INTO audit (seq, ts, actor, role, action, target, detail, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?)');
+        for (const r of audit) insert.run(r.seq, r.ts, r.actor, r.role, r.action, r.target, r.detail, r.prev_hash, r.hash);
+      });
+      this.lastHash = audit.at(-1)?.hash ?? this.lastHash;
+    } finally {
+      this.mirrorOn = mirror;
+    }
   }
 
   auditEntries(limit = 300) {

@@ -6,11 +6,17 @@ Crew health monitoring system for astronauts on long-duration space missions. It
 
 ## Running it
 
-Requires [Node.js](https://nodejs.org) 22.13 or later. There is nothing to install: the system has no third-party dependencies.
+Requires [Node.js](https://nodejs.org) 22.13 or later. The console is built with React and Vite.
+
+```bash
+npm install
+```
 
 ```bash
 npm start
 ```
+
+`npm start` builds the console and serves it from the Node server.
 
 Open <http://127.0.0.1:8787>. The first run creates one account per role, with random passwords, in `data/initial-credentials.txt`. Delete that file once the passwords are distributed.
 
@@ -26,6 +32,16 @@ Open <http://127.0.0.1:8787>. The first run creates one account per role, with r
 
 ```bash
 npm test
+```
+
+**To work on the console with live reload,** run these in two terminals, then open <http://localhost:5173>:
+
+```bash
+npm run dev:server
+```
+
+```bash
+npm run dev
 ```
 
 ## Core features
@@ -176,7 +192,7 @@ src/
   auth.js        Passwords, sessions, lockout
   server.js      HTTP API, live stream, static files
   crew.js        Fictional crew and accounts (replace with real records)
-public/          Console UI (no build step)
+web/             React + Vite console (builds to dist/)
 test/            Clinical, system and HTTP test suites
 ```
 

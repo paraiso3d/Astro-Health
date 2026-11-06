@@ -472,6 +472,7 @@ export class MissionSystem extends EventEmitter {
       dataSource: this.dataSource,
       mission: { ...this.mission, day: Math.floor((now - this.mission.startedAt) / DAY) + 1 },
       link: this.link.status(),
+      cloud: this.cloudStatus?.() ?? null,
       snapshotAgeMs: snap ? now - snap.ts : null,
       env: snap?.env ?? null,
       shelter: snap?.shelter ?? false,

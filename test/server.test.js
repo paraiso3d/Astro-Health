@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { after, before, describe, test } from 'node:test';
-import { createApp, provisionUsers } from '../src/server.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { generatePassword } from '../src/auth.js';
+import { USERS } from '../src/crew.js';
+import { createApp } from '../src/server.js';
 import { Store } from '../src/store.js';
 import { MissionSystem } from '../src/system.js';
 
 describe('HTTP API', () => {
-  let store, system, server, base, creds;
+  let store, system, server, base, creds, webRoot;
   const cookies = {};
 
   const call = async (path, { method = 'GET', body, as, headers = {} } = {}) => {
@@ -29,9 +34,23 @@ describe('HTTP API', () => {
 
   before(async () => {
     store = new Store(':memory:');
-    creds = provisionUsers(store);
+    creds = Object.fromEntries(USERS.map((u) => [u.username, generatePassword()]));
+    const directory = {
+      authenticate: async (username, password) => {
+        if (username === 'outage') throw new Error('network down');
+        const u = USERS.find((x) => x.username === username);
+        return u && creds[username] === password ? u : null;
+      },
+    };
     system = new MissionSystem({ store, delaySec: 1 });
-    server = createApp({ system, store, ingestToken: 'device-token' });
+    webRoot = mkdtempSync(join(tmpdir(), 'astrohealth-web-'));
+    const dist = join(webRoot, 'dist');
+    mkdirSync(join(dist, 'assets'), { recursive: true });
+    writeFileSync(join(dist, 'index.html'), '<!doctype html>');
+    writeFileSync(join(dist, 'assets', 'app.js'), 'export {};');
+    writeFileSync(join(dist, 'assets', 'app.css'), 'body {}');
+    writeFileSync(join(webRoot, 'secret.txt'), 'outside the web root');
+    server = createApp({ system, store, ingestToken: 'device-token', staticDir: dist, directory });
     await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
     base = `http://127.0.0.1:${server.address().port}`;
     for (const u of ['surgeon', 'ops', 'okafor', 'tanaka', 'moreau', 'silva']) await login(u);
@@ -40,15 +59,18 @@ describe('HTTP API', () => {
     server.closeAllConnections();
     server.close();
     store.close();
+    rmSync(webRoot, { recursive: true, force: true });
   });
 
-  test('accounts have unique random passwords, and only hashes are stored', () => {
+  test('generated passwords are long and unique', () => {
     const list = Object.values(creds);
     assert.equal(new Set(list).size, list.length);
     assert.ok(list.every((p) => p.length >= 16));
-    const row = store.getUser('surgeon');
-    assert.notEqual(row.hash, creds.surgeon);
-    assert.equal(provisionUsers(store), null, 'never re-provisions');
+  });
+  test('a sign-in service outage is reported, not treated as a wrong password', async () => {
+    const r = await call('/api/login', { method: 'POST', body: { username: 'outage', password: 'x' } });
+    assert.equal(r.status, 503);
+    assert.equal(store.auditEntries().some((e) => e.action === 'login.failed' && e.actor === 'outage'), false);
   });
   test('session cookies are HttpOnly and SameSite=Strict', async () => {
     const r = await call('/api/login', { method: 'POST', body: { username: 'ops', password: creds.ops } });
@@ -118,7 +140,7 @@ describe('HTTP API', () => {
     assert.equal((await fetch(`${base}/%E0%A4%A`)).status, 400);
   });
   test('path traversal cannot reach files outside public', async () => {
-    const paths = ['/../package.json', '/..%2f..%2fpackage.json', '/%2e%2e/src/server.js', '/..%5c..%5cpackage.json'];
+    const paths = ['/../secret.txt', '/..%2fsecret.txt', '/%2e%2e/secret.txt', '/..%5csecret.txt', '/../../package.json'];
     for (const p of paths) {
       const res = await new Promise((ok, fail) => {
         import('node:http').then(({ request }) => {
@@ -137,7 +159,7 @@ describe('HTTP API', () => {
     assert.match(res.headers.get('content-security-policy'), /default-src 'self'/);
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(res.headers.get('cache-control'), 'no-store');
-    for (const file of ['/app.js', '/charts.js', '/styles.css']) assert.equal((await fetch(base + file)).status, 200, file);
+    for (const file of ['/assets/app.js', '/assets/app.css']) assert.equal((await fetch(base + file)).status, 200, file);
   });
   test('the ingest endpoint needs the device token, and a session is no substitute', async () => {
     const body = { samples: [] };
